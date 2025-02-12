@@ -402,7 +402,15 @@ class Zonos(nn.Module):
                 # Decode the latent tokens into audio.
                 audio_partial = self.autoencoder.decode(partial_codes).cpu().detach()
                 # Only yield the new audio segment (i.e. audio beyond what we already yielded)
-                new_audio = audio_partial[..., prev_valid_length:]
+
+                # Instead of using a fixed factor (e.g. 512), calculate samples per token dynamically.
+                total_samples = audio_partial.shape[-1]
+                # Calculate a (possibly fractional) number of samples per latent token.
+                samples_per_token = total_samples / valid_length if valid_length > 0 else 0
+                start_sample = int(round(prev_valid_length * samples_per_token))
+                end_sample = int(round(valid_length * samples_per_token))
+                new_audio = audio_partial[..., start_sample:end_sample]
+
                 prev_valid_length = valid_length
 
                 # Yield a tuple: (sampling_rate, audio_chunk) where audio_chunk is a numpy array.
