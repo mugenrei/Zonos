@@ -1,6 +1,7 @@
 import torch
 import torchaudio
 import gradio as gr
+import numpy as np
 from os import getenv
 
 from zonos.model import Zonos, DEFAULT_BACKBONE_CLS as ZonosBackbone
@@ -110,8 +111,7 @@ def generate_audio(
     progress=gr.Progress(),
 ):
     """
-    Generates audio based on the provided UI parameters.
-    We do NOT use language_id or ctc_loss even if the model has them.
+    Non-streaming generation: generate codes, decode, and return the full audio.
     """
     selected_model = load_model_if_needed(model_choice)
 
@@ -129,7 +129,7 @@ def generate_audio(
     global SPEAKER_AUDIO_PATH, SPEAKER_EMBEDDING
 
     if randomize_seed:
-        seed = torch.randint(0, 2**32 - 1, (1,)).item()
+        seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
     torch.manual_seed(seed)
 
     if speaker_audio is not None and "speaker" not in unconditional_keys:
@@ -193,6 +193,109 @@ def generate_audio(
     return (sr_out, wav_out.squeeze().numpy()), seed
 
 
+def generate_audio_stream(
+    model_choice,
+    text,
+    language,
+    speaker_audio,
+    prefix_audio,
+    e1,
+    e2,
+    e3,
+    e4,
+    e5,
+    e6,
+    e7,
+    e8,
+    vq_single,
+    fmax,
+    pitch_std,
+    speaking_rate,
+    dnsmos_ovrl,
+    speaker_noised,
+    cfg_scale,
+    min_p,
+    seed,
+    randomize_seed,
+    unconditional_keys,
+    progress=gr.Progress(),
+):
+    """
+    Streaming generation: a generator function that yields (sampling_rate, audio_chunk)
+    tuples. The stream is constructed by incrementally decoding the latent codes.
+    Each yielded chunk is converted to int16.
+    """
+    selected_model = load_model_if_needed(model_choice)
+
+    speaker_noised_bool = bool(speaker_noised)
+    fmax = float(fmax)
+    pitch_std = float(pitch_std)
+    speaking_rate = float(speaking_rate)
+    dnsmos_ovrl = float(dnsmos_ovrl)
+    cfg_scale = float(cfg_scale)
+    min_p = float(min_p)
+    seed = int(seed)
+    max_new_tokens = 86 * 30
+
+    if randomize_seed:
+        seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
+    torch.manual_seed(seed)
+
+    speaker_embedding = None
+    if speaker_audio is not None and "speaker" not in unconditional_keys:
+        wav, sr = torchaudio.load(speaker_audio)
+        speaker_embedding = selected_model.make_speaker_embedding(wav, sr)
+        speaker_embedding = speaker_embedding.to(device, dtype=torch.bfloat16)
+
+    audio_prefix_codes = None
+    if prefix_audio is not None:
+        wav_prefix, sr_prefix = torchaudio.load(prefix_audio)
+        wav_prefix = wav_prefix.mean(0, keepdim=True)
+        wav_prefix = torchaudio.functional.resample(
+            wav_prefix, sr_prefix, selected_model.autoencoder.sampling_rate
+        )
+        wav_prefix = wav_prefix.to(device, dtype=torch.float32)
+        with torch.autocast(device, dtype=torch.float32):
+            audio_prefix_codes = selected_model.autoencoder.encode(wav_prefix.unsqueeze(0))
+
+    emotion_tensor = torch.tensor(list(map(float, [e1, e2, e3, e4, e5, e6, e7, e8])), device=device)
+    vq_val = float(vq_single)
+    vq_tensor = torch.tensor([vq_val] * 8, device=device).unsqueeze(0)
+
+    cond_dict = make_cond_dict(
+        text=text,
+        language=language,
+        speaker=speaker_embedding,
+        emotion=emotion_tensor,
+        vqscore_8=vq_tensor,
+        fmax=fmax,
+        pitch_std=pitch_std,
+        speaking_rate=speaking_rate,
+        dnsmos_ovrl=dnsmos_ovrl,
+        speaker_noised=speaker_noised_bool,
+        device=device,
+        unconditional_keys=unconditional_keys,
+    )
+    conditioning = selected_model.prepare_conditioning(cond_dict)
+
+    # Define a chunk size (yield a new audio chunk every 10 tokens)
+    chunk_size = 10
+
+    # Iterate over the model's generate_stream() output.
+    for sr_out, audio_chunk in selected_model.stream(
+        prefix_conditioning=conditioning,
+        audio_prefix_codes=audio_prefix_codes,
+        max_new_tokens=max_new_tokens,
+        cfg_scale=cfg_scale,
+        batch_size=1,
+        sampling_params=dict(min_p=min_p),
+        chunk_size=chunk_size,
+    ):
+        # audio_chunk is expected to be a numpy array in float32.
+        
+        yield (sr_out, audio_chunk)
+
+
 def build_interface():
     supported_models = []
     if "transformer" in ZonosBackbone.supported_architectures:
@@ -219,7 +322,7 @@ def build_interface():
                     label="Text to Synthesize",
                     value="Zonos uses eSpeak for text to phoneme conversion!",
                     lines=4,
-                    max_length=500,  # approximately
+                    max_length=500,
                 )
                 language = gr.Dropdown(
                     choices=supported_language_codes,
@@ -247,7 +350,6 @@ def build_interface():
                 vq_single_slider = gr.Slider(0.5, 0.8, 0.78, 0.01, label="VQ Score")
                 pitch_std_slider = gr.Slider(0.0, 300.0, value=45.0, step=1, label="Pitch Std")
                 speaking_rate_slider = gr.Slider(5.0, 30.0, value=15.0, step=0.5, label="Speaking Rate")
-
             with gr.Column():
                 gr.Markdown("## Generation Parameters")
                 cfg_scale_slider = gr.Slider(1.0, 5.0, 2.0, 0.1, label="CFG Scale")
@@ -276,7 +378,6 @@ def build_interface():
                     value=["emotion"],
                     label="Unconditional Keys",
                 )
-
             gr.Markdown(
                 "### Emotion Sliders\n"
                 "Warning: The way these sliders work is not intuitive and may require some trial and error to get the desired effect.\n"
@@ -296,6 +397,10 @@ def build_interface():
         with gr.Column():
             generate_button = gr.Button("Generate Audio")
             output_audio = gr.Audio(label="Generated Audio", type="numpy", autoplay=True)
+
+        with gr.Tab("Stream Audio"):
+            stream_button = gr.Button("Stream Audio", variant="primary")
+            stream_output = gr.Audio(label="Streaming Audio", type="numpy", streaming=True, autoplay=True)
 
         model_choice.change(
             fn=update_ui,
@@ -323,7 +428,7 @@ def build_interface():
             ],
         )
 
-        # On page load, trigger the same UI refresh
+        # On page load, trigger the same UI refresh.
         demo.load(
             fn=update_ui,
             inputs=[model_choice],
@@ -350,7 +455,7 @@ def build_interface():
             ],
         )
 
-        # Generate audio on button click
+        # Generate audio on button click.
         generate_button.click(
             fn=generate_audio,
             inputs=[
@@ -380,6 +485,38 @@ def build_interface():
                 unconditional_keys,
             ],
             outputs=[output_audio, seed_number],
+        )
+
+        # Stream audio on stream button click.
+        stream_button.click(
+            fn=generate_audio_stream,
+            inputs=[
+                model_choice,
+                text,
+                language,
+                speaker_audio,
+                prefix_audio,
+                emotion1,
+                emotion2,
+                emotion3,
+                emotion4,
+                emotion5,
+                emotion6,
+                emotion7,
+                emotion8,
+                vq_single_slider,
+                fmax_slider,
+                pitch_std_slider,
+                speaking_rate_slider,
+                dnsmos_slider,
+                speaker_noised_checkbox,
+                cfg_scale_slider,
+                min_p_slider,
+                seed_number,
+                randomize_seed_toggle,
+                unconditional_keys,
+            ],
+            outputs=stream_output,
         )
 
     return demo
