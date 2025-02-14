@@ -398,22 +398,13 @@ class Zonos(nn.Module):
                 valid_length = offset - 9
                 full_codes = revert_delay_pattern(delayed_codes)
                 # Get the valid portion of the latent sequence.
-                partial_codes = full_codes[..., :valid_length]
-                # Decode the latent tokens into audio.
-                audio_partial = self.autoencoder.decode(partial_codes).cpu().detach()
-                # Only yield the new audio segment (i.e. audio beyond what we already yielded)
+                partial_codes = full_codes[..., prev_valid_length:valid_length]
 
-                # Instead of using a fixed factor (e.g. 512), calculate samples per token dynamically.
-                total_samples = audio_partial.shape[-1]
-                # Calculate a (possibly fractional) number of samples per latent token.
-                samples_per_token = total_samples / valid_length if valid_length > 0 else 0
-                start_sample = int(round(prev_valid_length * samples_per_token))
-                end_sample = int(round(valid_length * samples_per_token))
-                new_audio = audio_partial[..., start_sample:end_sample]
+                decoded_audio = self.autoencoder.decode(partial_codes).cpu().detach()
 
                 prev_valid_length = valid_length
 
                 # Yield a tuple: (sampling_rate, audio_chunk) where audio_chunk is a numpy array.
-                yield (self.autoencoder.sampling_rate, new_audio.squeeze(0).numpy())
+                yield (self.autoencoder.sampling_rate, decoded_audio.squeeze(0).numpy())
 
         self._cg_graph = None  # reset CUDA graph to avoid caching issues

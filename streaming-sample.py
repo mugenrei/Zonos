@@ -30,17 +30,12 @@ def main():
 
     # --- STREAMING GENERATION ---
     # We set max_new_tokens lower for a short test (adjust as needed).
-    max_new_tokens = 86 * 5  # for example, a 5-second output (86 tokens per second)
     chunk_size = 10          # yield every 10 generated tokens
 
     print("Starting streaming generation...")
     stream_generator = model.stream(
         prefix_conditioning=conditioning,
         audio_prefix_codes=None,  # no audio prefix in this test
-        max_new_tokens=max_new_tokens,
-        cfg_scale=2.0,
-        batch_size=1,
-        sampling_params=dict(min_p=0.1),
         chunk_size=chunk_size
     )
 
