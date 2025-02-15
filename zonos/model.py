@@ -338,7 +338,7 @@ class Zonos(nn.Module):
 
         unknown_token = -1
         audio_seq_len = prefix_audio_len + max_new_tokens
-        seq_len = prefix_conditioning.shape[1] + audio_seq_len
+        seq_len = prefix_conditioning.shape[1] + audio_seq_len + 9
 
         with torch.device(device):
             inference_params = self.setup_cache(batch_size=batch_size * 2, max_seqlen=seq_len)
@@ -366,9 +366,9 @@ class Zonos(nn.Module):
         logit_bias[:, 1:, self.eos_token_id] = -torch.inf  # only allow codebook 0 to predict EOS
 
         # --- Autoregressive loop ---
-        stopping = torch.zeros(batch_size, dtype=torch.bool, device="cuda")
+        stopping = torch.zeros(batch_size, dtype=torch.bool, device=device)
         max_steps = delayed_codes.shape[2] - offset
-        remaining_steps = torch.full((batch_size,), max_steps, device="cuda")
+        remaining_steps = torch.full((batch_size,), max_steps, device=device)
         cfg_scale = torch.tensor(cfg_scale)
         step = 0
         # This variable will let us yield only the new audio since the last yield.
@@ -413,11 +413,9 @@ class Zonos(nn.Module):
                 valid_length = offset - 9
                 partial_codes = full_codes[..., prev_valid_length:valid_length]
 
-                decoded_audio = self.autoencoder.decode(partial_codes).cpu()
-
                 prev_valid_length = valid_length
 
                 # Yield a tuple: (sampling_rate, audio_chunk) where audio_chunk is a numpy array.
-                yield (self.autoencoder.sampling_rate, decoded_audio.squeeze(0).numpy())
+                yield (self.autoencoder.sampling_rate, partial_codes)
 
         self._cg_graph = None  # reset CUDA graph to avoid caching issues

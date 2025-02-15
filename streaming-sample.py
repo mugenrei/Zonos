@@ -41,9 +41,10 @@ def main():
 
     # Accumulate audio chunks as they are generated.
     audio_chunks = []
-    for sr_out, audio_chunk in stream_generator:
-        print(f"Received audio chunk of shape: {audio_chunk.shape}")
-        audio_chunks.append(audio_chunk)
+    for sr_out, codes_chunk in stream_generator:
+        print(f"Received codes chunk of shape: {codes_chunk.shape}")
+        audio_chunk = model.autoencoder.decode(codes_chunk).cpu()
+        audio_chunks.append(audio_chunk[0])
 
     if len(audio_chunks) == 0:
         print("No audio chunks were generated.")
