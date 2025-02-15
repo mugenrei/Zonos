@@ -46,7 +46,7 @@ class Zonos(nn.Module):
         prefix_conditioning: torch.Tensor,
         max_new_tokens: int = 86 * 30,
         chunk_size: int = 86 * 10,  # 10 seconds default
-        overlap_size: int = 86 * 2,  # 2 second overlap
+        overlap_size: int = 86 * 1.5,  # 1.5 second overlap
         audio_prefix_codes: torch.Tensor | None = None,
         cfg_scale: float = 2.0,
         batch_size: int = 1,

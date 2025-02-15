@@ -5,6 +5,7 @@ from os import getenv
 from typing import Tuple
 import numpy as np
 import nltk
+import math
 
 from zonos.model import Zonos
 from zonos.conditioning import make_cond_dict, supported_language_codes
@@ -89,25 +90,25 @@ def generate_with_latent_windows(
     model: Zonos,
     text: str,
     cond_dict: dict,
-    overlap_seconds: float = 0.3,
+    overlap_seconds: float = 0.1,
     cfg_scale: float = 2.0,
     min_p: float = 0.15,
     seed: int = 420,
 ) -> Tuple[int, np.ndarray]:
-    """Generate audio using sliding windows in latent space."""
+    """Generate audio using sliding windows in latent space"""
     try:
         nltk.data.find('tokenizers/punkt')
     except LookupError:
         nltk.download('punkt')
     
-    # Set global seed at the start
+    # Set global seed
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     
     # Split into sentences
     sentences = nltk.sent_tokenize(text)
     if len(sentences) == 1:
-        # Single sentence - just generate normally
+        # Single sentence - generate normally
         torch.manual_seed(seed)
         conditioning = model.prepare_conditioning(cond_dict)
         codes = model.generate(
@@ -136,7 +137,7 @@ def generate_with_latent_windows(
         conditioning = model.prepare_conditioning(sent_dict)
         codes = model.generate(
             prefix_conditioning=conditioning,
-            max_new_tokens=int(len(sentence) * 1.5 * tokens_per_second / 10),  # Rough estimate
+            max_new_tokens=int(len(sentence) * 1.5 * tokens_per_second / 10),
             cfg_scale=cfg_scale,
             batch_size=1,
             sampling_params=dict(min_p=min_p)
@@ -146,27 +147,44 @@ def generate_with_latent_windows(
             all_codes.append(codes)
             continue
             
-        # Crossfade with previous sentence
+        # Find best overlap position based on content similarity
         overlap_a = all_codes[-1][..., -overlap_size:]
         overlap_b = codes[..., :overlap_size]
         
-        # Replace overlap region in previous sentence
-        fade = torch.linspace(0, 1, overlap_size, device=codes.device)
+        # Calculate similarity scores across the overlap region
+        similarity = torch.cosine_similarity(
+            overlap_a.float(), 
+            overlap_b.float(),
+            dim=1
+        ).mean(dim=0)
+        
+        # Find the position with highest similarity for crossfade
+        best_pos = torch.argmax(similarity)
+        effective_overlap = overlap_size - best_pos
+        
+        # Apply cosine fade for smooth transition
+        fade = torch.cos(torch.linspace(math.pi, 0, effective_overlap, device=codes.device))
+        fade = 0.5 * (1 + fade)
         fade = fade.view(1, 1, -1)
-        overlap_region = overlap_a * (1 - fade) + overlap_b * fade
+        
+        # Crossfade at the best position
+        overlap_region = (
+            overlap_a[..., -effective_overlap:] * (1 - fade) + 
+            overlap_b[..., -effective_overlap:] * fade
+        )
         
         # Replace overlap region in previous sentence
         all_codes[-1] = torch.cat([
-            all_codes[-1][..., :-overlap_size],
+            all_codes[-1][..., :-effective_overlap],
             overlap_region
         ], dim=-1)
         
         # Add new sentence (excluding overlap)
-        all_codes.append(codes[..., overlap_size:])
+        all_codes.append(codes[..., effective_overlap:])
         
         # Check total length
         total_length = sum(c.shape[-1] for c in all_codes)
-        if total_length >= tokens_per_second * 30:  # 30 seconds max
+        if total_length >= tokens_per_second * 60:  # 60 seconds max
             break
     
     # Concatenate all sentences
@@ -197,8 +215,6 @@ def generate_audio(
     randomize_seed,
     unconditional_keys,
     use_windowing,
-    window_size,
-    window_overlap,
     progress=gr.Progress(),
 ):
     """
@@ -215,7 +231,7 @@ def generate_audio(
     cfg_scale = float(cfg_scale)
     min_p = float(min_p)
     seed = int(seed)
-    max_new_tokens = 86 * 30
+    max_new_tokens = 86 * 60
 
     # This is a bit ew, but works for now.
     global SPEAKER_AUDIO_PATH, SPEAKER_EMBEDDING
@@ -274,7 +290,7 @@ def generate_audio(
             selected_model,
             text,
             cond_dict,
-            overlap_seconds=window_overlap,
+            overlap_seconds=0.1,
             cfg_scale=cfg_scale,
             min_p=min_p,
             seed=seed
@@ -295,25 +311,6 @@ def generate_audio(
         if wav_out.dim() == 2 and wav_out.size(0) > 1:
             wav_out = wav_out[0:1, :]
         return (sr_out, wav_out.squeeze().numpy()), seed
-
-
-def validate_window_params(window_size: float, window_overlap: float) -> tuple[str, bool]:
-    if window_overlap >= window_size:
-        return "Overlap size must be smaller than window size", False
-    if window_size > 60:
-        return "Window size cannot exceed 60 seconds", False
-    if window_overlap < 0.1:
-        return "Overlap must be at least 0.1 seconds", False
-    return "", True
-
-
-def on_window_change(window_size: float, window_overlap: float):
-    error_msg, is_valid = validate_window_params(window_size, window_overlap)
-    return {
-        generate_button: gr.Button(interactive=is_valid),
-        error_text: error_msg
-    }
-
 
 def build_interface():
     with gr.Blocks() as demo:
@@ -388,6 +385,14 @@ def build_interface():
                 )
 
             gr.Markdown(
+                "### Latent Windowing\n"
+                "This feature processes longer texts by breaking them into sentences and generating them separately with smooth transitions in latent space. "
+                "It works best when used with voice cloning (speaker audio) using Transformers (not hybrid) and may produce inconsistent results otherwise. "
+                "Enable this if you're doing voice cloning with longer texts."
+            )
+            use_windowing = gr.Checkbox(label="Enable Latent Windowing", value=False)
+
+            gr.Markdown(
                 "### Emotion Sliders\n"
                 "Warning: The way these sliders work is not intuitive and may require some trial and error to get the desired effect.\n"
                 "Certain configurations can cause the model to become unstable. Setting emotion to unconditional may help."
@@ -404,12 +409,6 @@ def build_interface():
                 emotion8 = gr.Slider(0.0, 1.0, 0.2, 0.05, label="Neutral")
 
         with gr.Column():
-            gr.Markdown("## Windowing Parameters")
-            window_size = gr.Slider(1.0, 10.0, value=3.0, step=0.5, label="Window Size (seconds)")
-            window_overlap = gr.Slider(0.1, 2.0, value=0.3, step=0.1, label="Window Overlap (seconds)")
-            use_windowing = gr.Checkbox(label="Enable Latent Windowing", value=False)
-            error_text = gr.Textbox(label="Error", visible=True, interactive=False)
-
             generate_button = gr.Button("Generate Audio")
             output_audio = gr.Audio(label="Generated Audio", type="numpy", autoplay=True)
 
@@ -495,23 +494,9 @@ def build_interface():
                 randomize_seed_toggle,
                 unconditional_keys,
                 use_windowing,
-                window_size,
-                window_overlap,
             ],
             outputs=[output_audio, seed_number],
         )
-
-        with gr.Column():
-            window_size.change(
-                fn=on_window_change,
-                inputs=[window_size, window_overlap],
-                outputs=[generate_button, error_text]
-            )
-            window_overlap.change(
-                fn=on_window_change,
-                inputs=[window_size, window_overlap],
-                outputs=[generate_button, error_text]
-            )
 
     return demo
 
