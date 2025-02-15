@@ -113,7 +113,7 @@ def generate_with_latent_windows(
         conditioning = model.prepare_conditioning(cond_dict)
         codes = model.generate(
             prefix_conditioning=conditioning,
-            max_new_tokens=86 * 60,  # 60 seconds max
+            max_new_tokens=86 * 120,  # 120 seconds max
             cfg_scale=cfg_scale,
             batch_size=1,
             sampling_params=dict(min_p=min_p)
@@ -184,7 +184,7 @@ def generate_with_latent_windows(
         
         # Check total length
         total_length = sum(c.shape[-1] for c in all_codes)
-        if total_length >= tokens_per_second * 60:  # 60 seconds max
+        if total_length >= tokens_per_second * 120:  # 120 seconds max
             break
     
     # Concatenate all sentences
