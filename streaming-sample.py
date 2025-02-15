@@ -30,7 +30,7 @@ def main():
 
     # --- STREAMING GENERATION ---
     # We set max_new_tokens lower for a short test (adjust as needed).
-    chunk_size = 10          # yield every 10 generated tokens
+    chunk_size = 40          # yield every 40 generated tokens, less for faster streaming but lower quality
 
     print("Starting streaming generation...")
     stream_generator = model.stream(

@@ -3,6 +3,8 @@ import torchaudio
 import gradio as gr
 import numpy as np
 from os import getenv
+import io
+from pydub import AudioSegment
 
 from zonos.model import Zonos, DEFAULT_BACKBONE_CLS as ZonosBackbone
 from zonos.conditioning import make_cond_dict, supported_language_codes
@@ -192,6 +194,30 @@ def generate_audio(
         wav_out = wav_out[0:1, :]
     return (sr_out, wav_out.squeeze().numpy()), seed
 
+def numpy_to_mp3(audio_array, sampling_rate):
+    # Normalize audio_array if it's floating-point
+    if np.issubdtype(audio_array.dtype, np.floating):
+        max_val = np.max(np.abs(audio_array))
+        audio_array = (audio_array / max_val) * 32767 # Normalize to 16-bit range
+        audio_array = audio_array.astype(np.int16)
+
+    # Create an audio segment from the numpy array
+    audio_segment = AudioSegment(
+        audio_array.tobytes(),
+        frame_rate=sampling_rate,
+        sample_width=audio_array.dtype.itemsize,
+        channels=1
+    )
+
+    # Export the audio segment to MP3 bytes - use a high bitrate to maximise quality
+    mp3_io = io.BytesIO()
+    audio_segment.export(mp3_io, format="mp3", bitrate="320k")
+
+    # Get the MP3 bytes
+    mp3_bytes = mp3_io.getvalue()
+    mp3_io.close()
+
+    return mp3_bytes
 
 def generate_audio_stream(
     model_choice,
@@ -218,7 +244,7 @@ def generate_audio_stream(
     seed,
     randomize_seed,
     unconditional_keys,
-    progress=gr.Progress(),
+    chunk_size,
 ):
     """
     Streaming generation: a generator function that yields (sampling_rate, audio_chunk)
@@ -236,6 +262,7 @@ def generate_audio_stream(
     min_p = float(min_p)
     seed = int(seed)
     max_new_tokens = 86 * 30
+    chunk_size = 40
 
     if randomize_seed:
         seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
@@ -278,9 +305,6 @@ def generate_audio_stream(
     )
     conditioning = selected_model.prepare_conditioning(cond_dict)
 
-    # Define a chunk size (yield a new audio chunk every 10 tokens)
-    chunk_size = 10
-
     # Iterate over the model's generate_stream() output.
     for sr_out, audio_chunk in selected_model.stream(
         prefix_conditioning=conditioning,
@@ -293,7 +317,7 @@ def generate_audio_stream(
     ):
         # audio_chunk is expected to be a numpy array in float32.
         
-        yield (sr_out, audio_chunk)
+        yield numpy_to_mp3(audio_chunk, sampling_rate=sr_out), seed
 
 
 def build_interface():
@@ -356,6 +380,7 @@ def build_interface():
                 min_p_slider = gr.Slider(0.0, 1.0, 0.15, 0.01, label="Min P")
                 seed_number = gr.Number(label="Seed", value=420, precision=0)
                 randomize_seed_toggle = gr.Checkbox(label="Randomize Seed (before generation)", value=True)
+                chunk_size = gr.Slider(10, 100, value=40, step=5, label="Chunk Size")
 
         with gr.Accordion("Advanced Parameters", open=False):
             gr.Markdown(
@@ -515,8 +540,9 @@ def build_interface():
                 seed_number,
                 randomize_seed_toggle,
                 unconditional_keys,
+                chunk_size,
             ],
-            outputs=stream_output,
+            outputs=[stream_output, seed_number],
         )
 
     return demo
