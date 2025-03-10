@@ -321,11 +321,10 @@ class Zonos(nn.Module):
         audio_prefix_codes: torch.Tensor | None = None,  # optional audio prefix codes
         max_new_tokens: int = 86 * 30,
         cfg_scale: float = 2.0,
-        batch_size: int = 1,
         sampling_params: dict = dict(min_p=0.1),
         disable_torch_compile: bool = False,
-        chunk_schedule: list[int] = [20, 40, 60, 80],
-        chunk_overlap: int = 8,
+        chunk_schedule: list[int] = [20, 20, 40, 60, 80],
+        chunk_overlap: int = 2,
     ) -> Generator[torch.Tensor, None, None]:
         """
         Stream audio generation in chunks with smooth transitions between chunks.
@@ -335,7 +334,6 @@ class Zonos(nn.Module):
             audio_prefix_codes: Optional audio prefix codes
             max_new_tokens: Maximum number of new tokens to generate
             cfg_scale: Classifier-free guidance scale
-            batch_size: Batch size for generation
             sampling_params: Parameters for sampling from logits
             disable_torch_compile: Whether to disable torch.compile
             chunk_schedule: List of chunk sizes to use in sequence (will use the last size for remaining chunks)
@@ -348,6 +346,7 @@ class Zonos(nn.Module):
         assert len(chunk_schedule) > 0, "chunk_schedule must not be empty"
         assert all(chunk_overlap < size for size in chunk_schedule), "overlap must be less than all chunk sizes"
 
+        batch_size = 1  # Streaming generation is single-sample only
         prefix_audio_len = 0 if audio_prefix_codes is None else audio_prefix_codes.shape[2]
         device = self.device
 
@@ -451,6 +450,11 @@ class Zonos(nn.Module):
 
                 # Decode the current chunk to audio (keep on device)
                 current_audio = self.autoencoder.decode(partial_codes)[0]
+
+                # Apply fade-in to the first chunk
+                if previous_audio is None and current_audio.shape[-1] > window_size:
+                    fade_in = torch.linspace(0, 1, window_size, device=device)
+                    current_audio[..., :window_size] *= fade_in
 
                 # Apply windowing and overlap-add for smooth transitions
                 if (

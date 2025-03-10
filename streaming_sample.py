@@ -1,3 +1,5 @@
+import time
+
 import torch
 import torchaudio
 
@@ -34,22 +36,20 @@ def main():
 
     # Define chunk schedule: start with small chunks for faster initial output,
     # then gradually increase to larger chunks for fewer cuts
-    chunk_schedule = [20, 40, 60, 80]  # in tokens (about 0.23s, 0.47s, 0.7s, 0.93s)
-
     stream_generator = model.stream(
         prefix_conditioning=conditioning,
         audio_prefix_codes=None,  # no audio prefix in this test
-        chunk_schedule=chunk_schedule,
-        chunk_overlap=8,  # tokens to overlap between chunks (affects crossfade)
+        chunk_schedule=[20, 20, 40, 60, 80],
+        chunk_overlap=2,  # tokens to overlap between chunks (affects crossfade)
     )
 
     # Accumulate audio chunks as they are generated.
     audio_chunks = []
+    t0 = time.time()
 
     for i, audio_chunk in enumerate(stream_generator):
-        chunk_size = chunk_schedule[min(i, len(chunk_schedule) - 1)]
-        print(f"Received chunk {i + 1} (size ~{chunk_size} tokens): shape {audio_chunk.shape}")
-        # Move to CPU for storage
+        elapsed = int((time.time() - t0) * 1000)
+        print(f"Received chunk {i + 1}: shape {audio_chunk.shape} [{elapsed}ms]")
         audio_chunks.append(audio_chunk.cpu())
 
     if len(audio_chunks) == 0:
@@ -61,8 +61,8 @@ def main():
     out_sr = model.autoencoder.sampling_rate
 
     # Save the full audio as a WAV file.
-    torchaudio.save("stream_improved_sample.wav", full_audio, out_sr)
-    print(f"Saved streaming audio to 'stream_improved_sample.wav' (sampling rate: {out_sr} Hz).")
+    torchaudio.save("stream_sample.wav", full_audio, out_sr)
+    print(f"Saved streaming audio to 'stream_sample.wav' (sampling rate: {out_sr} Hz).")
 
 
 if __name__ == "__main__":
