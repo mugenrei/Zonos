@@ -403,6 +403,10 @@ class Zonos(nn.Module):
         samples_per_token = 512  # Approximate value based on DAC model
         window_size = chunk_overlap * samples_per_token
 
+        # Create window functions (more efficient with torch operations)
+        fade_in = torch.linspace(0, 1, window_size, device=device)
+        fade_out = torch.linspace(1, 0, window_size, device=device)
+
         while torch.max(remaining_steps) > 0:
             offset += 1
             input_ids = delayed_codes[..., offset - 1 : offset]
@@ -453,7 +457,6 @@ class Zonos(nn.Module):
 
                 # Apply fade-in to the first chunk
                 if previous_audio is None and current_audio.shape[-1] > window_size:
-                    fade_in = torch.linspace(0, 1, window_size, device=device)
                     current_audio[..., :window_size] *= fade_in
 
                 # Apply windowing and overlap-add for smooth transitions
@@ -462,10 +465,6 @@ class Zonos(nn.Module):
                     and current_audio.shape[-1] > window_size
                     and previous_audio.shape[-1] > window_size
                 ):
-                    # Create window functions (more efficient with torch operations)
-                    fade_in = torch.linspace(0, 1, window_size, device=device)
-                    fade_out = torch.linspace(1, 0, window_size, device=device)
-
                     # Apply windowing to overlapping regions
                     current_audio_start = current_audio[..., :window_size].clone()
                     previous_audio_end = previous_audio[..., -window_size:].clone()
