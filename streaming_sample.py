@@ -39,8 +39,8 @@ def main():
     stream_generator = model.stream(
         prefix_conditioning=conditioning,
         audio_prefix_codes=None,  # no audio prefix in this test
-        chunk_schedule=[20, 20, 40, 60, 80],
-        chunk_overlap=2,  # tokens to overlap between chunks (affects crossfade)
+        chunk_schedule=[17, *range(9, 100)],  # optimal schedule for RTX4090
+        chunk_overlap=1,  # tokens to overlap between chunks (affects crossfade)
     )
 
     # Accumulate audio chunks as they are generated.
@@ -49,7 +49,9 @@ def main():
 
     for i, audio_chunk in enumerate(stream_generator):
         elapsed = int((time.time() - t0) * 1000)
-        print(f"Received chunk {i + 1}: shape {audio_chunk.shape} [{elapsed}ms]")
+        print(
+            f"Received chunk {i + 1}: time {elapsed}ms | generated up to {audio_chunk.shape[1] / 44.1 + elapsed:.0f}ms"
+        )
         audio_chunks.append(audio_chunk.cpu())
 
     if len(audio_chunks) == 0:
