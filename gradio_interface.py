@@ -1,3 +1,4 @@
+import re
 import torch
 import torchaudio
 import gradio as gr
@@ -5,10 +6,14 @@ import numpy as np
 from os import getenv
 import io
 from pydub import AudioSegment
-from typing import Tuple
 import numpy as np
 import nltk
 import math
+import importlib
+from typing import Tuple, List, Optional, Any
+import torch.nn.functional as F
+import time
+import logging
 
 from zonos.model import Zonos, DEFAULT_BACKBONE_CLS as ZonosBackbone
 from zonos.conditioning import make_cond_dict, supported_language_codes
@@ -20,6 +25,13 @@ CURRENT_MODEL = None
 SPEAKER_EMBEDDING = None
 SPEAKER_AUDIO_PATH = None
 
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("audio_generation")
 
 def load_model_if_needed(model_choice: str):
     global CURRENT_MODEL_TYPE, CURRENT_MODEL
@@ -89,29 +101,368 @@ def update_ui(model_choice):
     )
 
 
+def detect_language(text: str) -> str:
+    """
+    Detect if the text is primarily Japanese, Chinese, or another language.
+    Returns: 'ja', 'zh', or 'other'
+    """
+    # Count characters in different scripts
+    jp_chars = len(re.findall(r'[\u3040-\u309F\u30A0-\u30FF]', text))  # Hiragana & Katakana
+    cn_chars = len(re.findall(r'[\u4E00-\u9FFF]', text))  # Han characters (shared by Japanese & Chinese)
+    
+    # Check for specific Chinese punctuation that's less common in Japanese
+    cn_specific = len(re.findall(r'[，；：""《》【】]', text))
+    
+    # Check for Japanese-specific particles and endings
+    jp_specific = len(re.findall(r'(です|ます|だ|した|ない|ました|でした)', text))
+    
+    if jp_chars > 0 or jp_specific >= 2:
+        return 'ja'
+    elif cn_chars > 0 and (cn_specific > 0 or jp_chars == 0):
+        return 'zh'
+    else:
+        return 'other'
+
+def check_tokenizer_available(package_name: str) -> bool:
+    """Check if a package is installed."""
+    return importlib.util.find_spec(package_name) is not None
+
+def segment_japanese_text(text: str) -> List[str]:
+    """
+    Segment Japanese text into sentences using specialized libraries if available.
+    Falls back to simpler methods if specialized libraries aren't installed.
+    """
+    # First choice: spaCy with Japanese model if available
+    if check_tokenizer_available('spacy'):
+        try:
+            import spacy
+            try:
+                nlp = spacy.load('ja_core_news_sm')
+                doc = nlp(text)
+                return [sent.text.strip() for sent in doc.sents]
+            except:
+                # Japanese model not installed
+                pass
+        except:
+            pass
+    
+    # Second choice: MeCab if available
+    if check_tokenizer_available('fugashi'):
+        try:
+            import fugashi
+            mecab = fugashi.Tagger()
+            
+            # Custom sentence splitting using MeCab's parsing
+            sentences = []
+            current_sentence = ""
+            
+            for word in mecab(text):
+                current_sentence += word.surface
+                
+                # Check for sentence endings (periods, question marks, exclamation marks)
+                if word.surface in ["。", "！", "？", "…"] or \
+                   (word.pos == "記号" and word.surface in [".", "!", "?"]):
+                    sentences.append(current_sentence)
+                    current_sentence = ""
+            
+            # Add the last sentence if there's anything left
+            if current_sentence:
+                sentences.append(current_sentence)
+                
+            return sentences
+        except:
+            pass
+            
+    # Third choice: Janome if available
+    if check_tokenizer_available('janome'):
+        try:
+            from janome.tokenizer import Tokenizer
+            tokenizer = Tokenizer()
+            
+            # Split on common Japanese sentence endings
+            sentences = []
+            current_sentence = ""
+            
+            for token in tokenizer.tokenize(text):
+                current_sentence += token.surface
+                if token.surface in ["。", "！", "？"] or \
+                   (token.part_of_speech.split(',')[0] == "記号" and token.surface in [".", "!", "?"]):
+                    sentences.append(current_sentence)
+                    current_sentence = ""
+            
+            # Add the last sentence if there's anything left
+            if current_sentence:
+                sentences.append(current_sentence)
+                
+            return sentences
+        except:
+            pass
+    
+    # Fallback: Simple rule-based splitting
+    sentences = re.split(r'([。！？])', text)
+    result = []
+    
+    # Rejoin the sentences with their punctuation
+    for i in range(0, len(sentences) - 1, 2):
+        if i + 1 < len(sentences):
+            result.append(sentences[i] + sentences[i+1])
+    
+    # Add the last part if there's an odd number of elements
+    if len(sentences) % 2 == 1 and sentences[-1]:
+        result.append(sentences[-1])
+        
+    return [s for s in result if s.strip()]
+
+def segment_chinese_text(text: str) -> List[str]:
+    """
+    Segment Chinese text into sentences using specialized libraries if available.
+    Falls back to simpler methods if specialized libraries aren't installed.
+    """
+    # First choice: spaCy with Chinese model if available
+    if check_tokenizer_available('spacy'):
+        try:
+            import spacy
+            try:
+                nlp = spacy.load('zh_core_web_sm')
+                doc = nlp(text)
+                return [sent.text.strip() for sent in doc.sents]
+            except:
+                # Chinese model not installed
+                pass
+        except:
+            pass
+    
+    # Second choice: Jieba if available
+    if check_tokenizer_available('jieba'):
+        try:
+            import jieba.posseg as pseg
+            
+            # Custom sentence splitting using punctuation
+            sentences = re.split(r'([。！？\!\.。]+)', text)
+            result = []
+            
+            # Rejoin the sentences with their punctuation
+            for i in range(0, len(sentences) - 1, 2):
+                if i + 1 < len(sentences):
+                    result.append(sentences[i] + sentences[i+1])
+            
+            # Add the last part if there's an odd number of elements
+            if len(sentences) % 2 == 1 and sentences[-1]:
+                result.append(sentences[-1])
+                
+            return [s for s in result if s.strip()]
+        except:
+            pass
+    
+    # Fallback: Simple rule-based splitting
+    sentences = re.split(r'([。！？\.!?])', text)
+    result = []
+    
+    # Rejoin the sentences with their punctuation
+    for i in range(0, len(sentences) - 1, 2):
+        if i + 1 < len(sentences):
+            result.append(sentences[i] + sentences[i+1])
+    
+    # Add the last part if there's an odd number of elements
+    if len(sentences) % 2 == 1 and sentences[-1]:
+        result.append(sentences[-1])
+        
+    return [s for s in result if s.strip()]
+
+def get_last_n_words(text: str, n: int = 3) -> str:
+    """Extract the last n words from a text."""
+    words = text.split()
+    return " ".join(words[-n:]) if len(words) >= n else text
+
+def estimate_word_duration_in_tokens(word: str, tokens_per_second: int, speaking_rate: float = 20.0) -> int:
+    """
+    Estimate how many latent tokens a word might take based on speaking rate.
+    """
+    logger.debug(f"Estimating duration for word: '{word}' with speaking rate: {speaking_rate}")
+    
+    # Default rate if none specified
+    if speaking_rate <= 0:
+        speaking_rate = 20.0
+    
+    # Cap the rate at the maximum value (40)
+    speaking_rate = min(speaking_rate, 40.0)
+    
+    # Estimate number of phonemes based on character count
+    # English averages ~0.7-1.0 phonemes per character
+    estimated_phonemes = len(word) * 0.8
+    
+    # Special case for very short words which often have more phonemes than chars
+    if len(word) <= 2:
+        estimated_phonemes = max(estimated_phonemes, 2.0)
+    
+    # Calculate duration in seconds based on speaking rate
+    duration_seconds = estimated_phonemes / speaking_rate
+    
+    # Convert to latent tokens and ensure minimum of 1 token
+    tokens = max(1, int(duration_seconds * tokens_per_second))
+    
+    logger.debug(f"Estimated {tokens} tokens for '{word}'")
+    return tokens
+
+def smooth_latent_transition(
+    codes_a: torch.Tensor, 
+    codes_b: torch.Tensor, 
+    overlap_tokens: int,
+    smoothing_strength: float = 0.5
+) -> torch.Tensor:
+    """
+    Create a smoother transition between two segments of latent codes
+    """
+    logger.info(f"Smoothing transition with overlap of {overlap_tokens} tokens, strength {smoothing_strength}")
+    start_time = time.time()
+    
+    # Ensure we don't try to overlap more than we have available
+    overlap_tokens = min(overlap_tokens, codes_a.size(-1), codes_b.size(-1))
+    logger.debug(f"Using effective overlap of {overlap_tokens} tokens")
+    
+    # Extract the overlap regions
+    overlap_a = codes_a[..., -overlap_tokens:]
+    overlap_b = codes_b[..., :overlap_tokens]
+    
+    # 1. Apply Gaussian smoothing to reduce high-frequency discontinuities
+    kernel_size = min(9, overlap_tokens // 2 * 2 + 1)  # Must be odd
+    logger.debug(f"Using Gaussian kernel size of {kernel_size}")
+    
+    if kernel_size >= 3:
+        sigma = smoothing_strength * 2.0
+        # Reshape for conv1d which expects [N, C, L] format
+        orig_shape = overlap_a.shape
+        overlap_a_smoothed = overlap_a.float().reshape(-1, 1, overlap_tokens)
+        overlap_b_smoothed = overlap_b.float().reshape(-1, 1, overlap_tokens)
+        
+        # Apply Gaussian smoothing
+        overlap_a_smoothed = gaussian_blur1d(overlap_a_smoothed, kernel_size, sigma)
+        overlap_b_smoothed = gaussian_blur1d(overlap_b_smoothed, kernel_size, sigma)
+        
+        # Reshape back
+        overlap_a_smoothed = overlap_a_smoothed.reshape(orig_shape)
+        overlap_b_smoothed = overlap_b_smoothed.reshape(orig_shape)
+    else:
+        overlap_a_smoothed = overlap_a.float()
+        overlap_b_smoothed = overlap_b.float()
+    
+    # 2. Find optimal alignment point where similarity is highest
+    logger.debug("Finding optimal alignment point")
+    similarity_scores = torch.nn.functional.cosine_similarity(
+        overlap_a_smoothed.float(), 
+        overlap_b_smoothed.float(),
+        dim=1
+    ).mean(dim=0)
+    
+    best_pos = torch.argmax(similarity_scores)
+    effective_overlap = overlap_tokens - best_pos
+    logger.info(f"Found best alignment at position {best_pos}, effective overlap: {effective_overlap}")
+    
+    # 3. Create smoother crossfade - use S-curve instead of linear blend
+    # S-curve fading creates more natural transitions than cosine
+    t = torch.linspace(0, 1, effective_overlap, device=codes_a.device)
+    fade_curve = 0.5 * (1 + torch.sin(math.pi * (t - 0.5)))
+    fade_in = fade_curve.view(1, 1, -1)
+    fade_out = 1 - fade_in
+    
+    # Apply crossfade at the optimal position
+    transition_region = (
+        overlap_a[..., -effective_overlap:].float() * fade_out + 
+        overlap_b[..., best_pos:best_pos+effective_overlap].float() * fade_in
+    )
+    
+    # Construct final output
+    non_overlap_a = codes_a[..., :-effective_overlap]
+    non_overlap_b = codes_b[..., best_pos+effective_overlap:]
+    
+    result = torch.cat([
+        non_overlap_a, 
+        transition_region.to(codes_a.dtype), 
+        non_overlap_b
+    ], dim=-1)
+    
+    logger.info(f"Smoothing completed in {time.time() - start_time:.2f}s, output length: {result.shape[-1]}")
+    return result
+
+def gaussian_blur1d(x, kernel_size, sigma):
+    """Custom implementation of 1D Gaussian blur if torch.nn.functional doesn't have it"""
+    channels = x.shape[1]
+    
+    # Create 1D Gaussian kernel
+    kernel_range = torch.arange(kernel_size, device=x.device) - (kernel_size - 1) / 2
+    kernel = torch.exp(-0.5 * kernel_range**2 / sigma**2)
+    kernel = kernel / kernel.sum()
+    kernel = kernel.view(1, 1, kernel_size).repeat(channels, 1, 1)
+    
+    # Padding
+    padding = (kernel_size - 1) // 2
+    padded_input = F.pad(x, (padding, padding), mode='reflect')
+    
+    # Group convolution
+    return F.conv1d(padded_input, kernel, groups=channels)
+
+
 def generate_with_latent_windows(
-    model: Zonos,
+    model: Any,
     text: str,
     cond_dict: dict,
-    overlap_seconds: float = 0.1,
+    overlap_seconds: float = 0.2,
     cfg_scale: float = 2.0,
     min_p: float = 0.15,
     seed: int = 420,
+    prefix_words: int = 3,
+    smoothing_strength: float = 0.5
 ) -> Tuple[int, np.ndarray]:
-    """Generate audio using sliding windows in latent space"""
+    """
+    Generate audio using sliding windows in latent space with enhanced audio quality
+    by reducing popping and noise artifacts at segment boundaries.
+    """
+    logger.info(f"Starting generation with {len(text)} characters of text")
+    logger.info(f"Parameters: overlap={overlap_seconds}s, cfg_scale={cfg_scale}, min_p={min_p}, seed={seed}")
+    start_time = time.time()
+    
     try:
         nltk.data.find('tokenizers/punkt')
     except LookupError:
+        logger.info("Downloading NLTK punkt tokenizer")
         nltk.download('punkt')
     
     # Set global seed
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     
-    # Split into sentences
-    sentences = nltk.sent_tokenize(text)
+    # Extract speaking rate from conditioning if available
+    speaking_rate = 20.0  # Default medium rate
+    if 'speaking_rate' in cond_dict:
+        speaking_rate = float(cond_dict['speaking_rate'])
+    logger.info(f"Using speaking rate: {speaking_rate}")
+    
+    # Detect language and use appropriate tokenization
+    language = detect_language(text) if 'detect_language' in globals() else 'other'
+    logger.info(f"Detected language: {language}")
+    
+    if language == 'ja' and 'segment_japanese_text' in globals():
+        sentences = segment_japanese_text(text)
+    elif language == 'zh' and 'segment_chinese_text' in globals():
+        sentences = segment_chinese_text(text)
+    else:
+        sentences = nltk.sent_tokenize(text)
+    
+    # Handle empty or missing sentences
+    if not sentences:
+        logger.warning("No sentences detected, using full text as a single sentence")
+        sentences = [text]
+    
+    logger.info(f"Split text into {len(sentences)} sentences")
+    for i, s in enumerate(sentences):
+        logger.debug(f"Sentence {i+1}: {s[:50]}{'...' if len(s) > 50 else ''}")
+    
+    tokens_per_second = 86
+    overlap_size = int(overlap_seconds * tokens_per_second)
+    
     if len(sentences) == 1:
         # Single sentence - generate normally
+        logger.info("Only one sentence, generating directly")
         torch.manual_seed(seed)
         conditioning = model.prepare_conditioning(cond_dict)
         codes = model.generate(
@@ -121,81 +472,109 @@ def generate_with_latent_windows(
             batch_size=1,
             sampling_params=dict(min_p=min_p)
         )
+        logger.info(f"Generated {codes.shape[-1]} tokens ({codes.shape[-1]/tokens_per_second:.2f}s of audio)")
         wav_out = model.autoencoder.decode(codes).cpu().detach()
+        logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
         return model.autoencoder.sampling_rate, wav_out.squeeze().numpy()
 
-    # Calculate window sizes in latent tokens
-    tokens_per_second = 86
-    overlap_size = int(overlap_seconds * tokens_per_second)
-    
+    # For multiple sentences, we need to process each one
     all_codes = []
+    last_generated_codes = None
     
     for i, sentence in enumerate(sentences):
+        logger.info(f"Processing sentence {i+1}/{len(sentences)}: {sentence[:50]}{'...' if len(sentence) > 50 else ''}")
+        sentence_start_time = time.time()
+        
         # Create conditioning for this sentence
         sent_dict = cond_dict.copy()
-        sent_dict['espeak'] = ([sentence], [cond_dict['espeak'][1][0]])
         
-        # Generate this sentence
-        torch.manual_seed(seed)
-        conditioning = model.prepare_conditioning(sent_dict)
-        codes = model.generate(
-            prefix_conditioning=conditioning,
-            max_new_tokens=int(len(sentence) * 1.5 * tokens_per_second / 10),
-            cfg_scale=cfg_scale,
-            batch_size=1,
-            sampling_params=dict(min_p=min_p)
-        )
-        
-        if i == 0:
-            all_codes.append(codes)
-            continue
+        if i > 0:
+            # Extract last few words from previous sentence as prefix text
+            prefix_text = get_last_n_words(sentences[i-1], prefix_words)
+            logger.info(f"Using prefix from previous sentence: '{prefix_text}'")
             
-        # Find best overlap position based on content similarity
-        overlap_a = all_codes[-1][..., -overlap_size:]
-        overlap_b = codes[..., :overlap_size]
+            # Estimate tokens needed for prefix using speaking rate
+            prefix_tokens = estimate_word_duration_in_tokens(
+                prefix_text, tokens_per_second, speaking_rate
+            )
+            
+            # Ensure minimum overlap
+            prefix_tokens = max(prefix_tokens, overlap_size)
+            logger.debug(f"Using {prefix_tokens} tokens for prefix")
+            
+            # Take audio codes from the end of previous generation as prefix
+            audio_prefix_codes = last_generated_codes[..., -prefix_tokens:]
+            
+            # Create prefixed text for TTS
+            prefixed_sentence = f"{prefix_text} {sentence}"
+            sent_dict['espeak'] = ([prefixed_sentence], [cond_dict['espeak'][1][0]])
+            
+            # Generate with audio prefix
+            logger.info(f"Generating with audio prefix ({prefix_tokens} tokens)")
+            torch.manual_seed(seed)
+            conditioning = model.prepare_conditioning(sent_dict)
+            max_tokens = int(len(sentence) * 1.5 * tokens_per_second / (10 * (speaking_rate/20)))
+            logger.debug(f"max_new_tokens = {max_tokens}")
+            
+            codes = model.generate(
+                prefix_conditioning=conditioning,
+                audio_prefix_codes=audio_prefix_codes,
+                max_new_tokens=max_tokens,
+                cfg_scale=cfg_scale,
+                batch_size=1,
+                sampling_params=dict(min_p=min_p)
+            )
+            
+            logger.info(f"Generated {codes.shape[-1]} tokens for sentence {i+1}")
+            
+            # For the second segment onwards, we add without the prefix portion
+            new_segment = codes[..., prefix_tokens:]
+            all_codes.append(new_segment)
+            
+            # Store full segment for next iteration's prefix
+            last_generated_codes = codes
+            
+        else:
+            # First sentence - generate normally
+            sent_dict['espeak'] = ([sentence], [cond_dict['espeak'][1][0]])
+            logger.info("Generating first sentence")
+            torch.manual_seed(seed)
+            conditioning = model.prepare_conditioning(sent_dict)
+            max_tokens = int(len(sentence) * 1.5 * tokens_per_second / (10 * (speaking_rate/20)))
+            logger.debug(f"max_new_tokens = {max_tokens}")
+            
+            codes = model.generate(
+                prefix_conditioning=conditioning,
+                max_new_tokens=max_tokens,
+                cfg_scale=cfg_scale,
+                batch_size=1,
+                sampling_params=dict(min_p=min_p)
+            )
+            
+            logger.info(f"Generated {codes.shape[-1]} tokens for sentence {i+1}")
+            all_codes.append(codes)
+            last_generated_codes = codes
         
-        # Calculate similarity scores across the overlap region
-        similarity = torch.cosine_similarity(
-            overlap_a.float(), 
-            overlap_b.float(),
-            dim=1
-        ).mean(dim=0)
-        
-        # Find the position with highest similarity for crossfade
-        best_pos = torch.argmax(similarity)
-        effective_overlap = overlap_size - best_pos
-        
-        # Apply cosine fade for smooth transition
-        fade = torch.cos(torch.linspace(math.pi, 0, effective_overlap, device=codes.device))
-        fade = 0.5 * (1 + fade)
-        fade = fade.view(1, 1, -1)
-        
-        # Crossfade at the best position
-        overlap_region = (
-            overlap_a[..., -effective_overlap:] * (1 - fade) + 
-            overlap_b[..., -effective_overlap:] * fade
-        )
-        
-        # Replace overlap region in previous sentence
-        all_codes[-1] = torch.cat([
-            all_codes[-1][..., :-effective_overlap],
-            overlap_region
-        ], dim=-1)
-        
-        # Add new sentence (excluding overlap)
-        all_codes.append(codes[..., effective_overlap:])
+        logger.info(f"Sentence {i+1} processed in {time.time() - sentence_start_time:.2f}s")
         
         # Check total length
         total_length = sum(c.shape[-1] for c in all_codes)
+        logger.info(f"Current total: {total_length} tokens ({total_length/tokens_per_second:.2f}s)")
+        
         if total_length >= tokens_per_second * 120:  # 120 seconds max
+            logger.warning("Reached maximum length, truncating remaining sentences")
             break
     
-    # Concatenate all sentences
+    # Concatenate all segments
+    logger.info(f"Concatenating {len(all_codes)} segments")
     final_codes = torch.cat(all_codes, dim=-1)
     final_codes = final_codes.to(torch.long)
     
     # Decode to audio
+    logger.info(f"Decoding {final_codes.shape[-1]} tokens to audio")
     wav_out = model.autoencoder.decode(final_codes).cpu().detach()
+    
+    logger.info(f"Total generation completed in {time.time() - start_time:.2f}s")
     return model.autoencoder.sampling_rate, wav_out.squeeze().numpy()
 
 
@@ -272,7 +651,7 @@ def generate_audio(
 
     vq_val = float(vq_single)
     vq_tensor = torch.tensor([vq_val] * 8, device=device).unsqueeze(0)
-
+    
     cond_dict = make_cond_dict(
         text=text,
         language=language,
