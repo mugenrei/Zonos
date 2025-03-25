@@ -64,7 +64,12 @@ class Zonos(nn.Module):
 
     @classmethod
     def from_local(
-        cls, config_path: str, model_path: str, device: str = DEFAULT_DEVICE, backbone: str | None = None
+        cls,
+        config_path: str,
+        model_path: str,
+        device: str = DEFAULT_DEVICE,
+        backbone: str | None = None,
+        speaker_model_path: str | None = None,
     ) -> "Zonos":
         config = ZonosConfig.from_dict(json.load(open(config_path)))
         if backbone:
@@ -84,6 +89,9 @@ class Zonos(nn.Module):
             for k in f.keys():
                 sd[k] = f.get_tensor(k)
         model.load_state_dict(sd)
+
+        if speaker_model_path:
+            model.spk_clone_model = SpeakerEmbeddingLDA(device, speaker_model_path)
 
         return model
 
