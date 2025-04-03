@@ -26,6 +26,7 @@ emotions = [
     [0, 0, 0, 0, 0, 0, 1.0, 0],
     [0, 0, 0, 0, 0, 0, 0, 1.0],
 ]
+pitch_stds = range(80, 161, 20)
 
 
 def main():
@@ -46,12 +47,12 @@ def main():
     torch.manual_seed(421)
 
     def generator():
-        for text, emotion in zip(texts, emotions):
+        for text, emotion, pitch_std in zip(texts, emotions, pitch_stds):
             yield {
                 "text": text,
                 "speaker": speaker,
                 "emotion": emotion,
-                "pitch_std": 120,
+                "pitch_std": pitch_std,
                 "language": "en-us",
             }
 

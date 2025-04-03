@@ -374,13 +374,14 @@ class Zonos(nn.Module):
 
         # Set up previous text and codes for hot swapping
         prev_text = ""
+        previous_audio = None
 
         # Main loop: iterate over sentences in the prefix conditioning. For each sentence, we'll be streaming audio chunks out.
         # Once the sentence is ready, we'll hot swap the previous text and codes with the new ones and use them as
         # audio_prefix_codes for the next sentence. Each subsequent generation is conditioned on the previous text and codes.
         for cond_dict in cond_dicts_generator:
             # Prepend the conditioning dictionary text with the previous sentence text
-            curr_text = cond_dict["text"] + " ... "  # this is quite hacky, but it works to avoid abruptly cutting off
+            curr_text = cond_dict["text"] + " "
             updated_cond_dict = {**cond_dict, "text": prev_text + curr_text}
             prev_text = curr_text
 
@@ -428,7 +429,6 @@ class Zonos(nn.Module):
 
             # For chunk scheduling
             schedule_index = 0
-            previous_audio = None
 
             while torch.max(remaining_steps) > 0:
                 offset += 1
@@ -506,11 +506,6 @@ class Zonos(nn.Module):
                     if schedule_index < len(chunk_schedule) - 1:
                         schedule_index += 1
 
-            # Don't forget to yield the final faded audio chunk
-            if previous_audio is not None:
-                previous_audio[..., -window_size:] *= fade[: min(window_size, previous_audio.shape[-1])]
-                yield previous_audio
-
             # Assemble the full codes for this sentence
             out_codes = revert_delay_pattern(delayed_codes)
             out_codes.masked_fill_(out_codes >= 1024, 0)
@@ -523,3 +518,8 @@ class Zonos(nn.Module):
                 audio_prefix_codes = out_codes
 
             self._cg_graph = None  # reset CUDA graph to avoid caching issues
+
+        # Don't forget to yield the final faded audio chunk
+        if previous_audio is not None:
+            previous_audio[..., -window_size:] *= fade[: min(window_size, previous_audio.shape[-1])]
+            yield previous_audio
