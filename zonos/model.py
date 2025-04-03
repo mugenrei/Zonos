@@ -488,22 +488,17 @@ class Zonos(nn.Module):
                         and previous_audio.shape[-1] > window_size
                     ):
                         # Apply windowing to overlapping regions
-                        current_audio_start = current_audio[..., :window_size].clone()
-                        previous_audio_end = previous_audio[..., -window_size:].clone()
+                        curr_audio_start = current_audio[..., :window_size].clone()
+                        prev_audio_end = previous_audio[..., -window_size:].clone()
 
                         # Crossfade the overlapping region
-                        current_audio[..., :window_size] = current_audio_start * fade + previous_audio_end * (1 - fade)
+                        previous_audio[..., -window_size:] = curr_audio_start * fade + prev_audio_end * (1 - fade)
 
-                        # Yield the previous audio up to the overlap point
-                        audio_to_yield = previous_audio[..., :-window_size]
-                    else:
-                        # For the first chunk or if chunks are too small
-                        audio_to_yield = previous_audio if previous_audio is not None else None
+                    if previous_audio is not None:
+                        yield previous_audio
 
-                    # Store current audio for next iteration
-                    previous_audio = current_audio
-
-                    # Update for next chunk
+                    # Store current audio for next iteration and update counters
+                    previous_audio = current_audio[..., window_size:]
                     prev_valid_length = valid_length
                     chunk_counter = 0
 
@@ -511,12 +506,9 @@ class Zonos(nn.Module):
                     if schedule_index < len(chunk_schedule) - 1:
                         schedule_index += 1
 
-                    # Yield the audio (skip first yield since we need to wait for the next chunk for overlap)
-                    if audio_to_yield is not None:
-                        yield audio_to_yield
-
-            # Don't forget to yield the final audio chunk
+            # Don't forget to yield the final faded audio chunk
             if previous_audio is not None:
+                previous_audio[..., -window_size:] *= fade[: min(window_size, previous_audio.shape[-1])]
                 yield previous_audio
 
             # Assemble the full codes for this sentence
