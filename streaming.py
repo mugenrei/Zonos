@@ -94,8 +94,8 @@ def main():
 
     # Save the full audio as a WAV file.
     out_sr = model.autoencoder.sampling_rate
-    torchaudio.save("stream_sample.wav", audio, out_sr)
-    print(f"Saved streaming audio to 'stream_sample.wav' (sampling rate: {out_sr} Hz).")
+    torchaudio.save("streaming.wav", audio, out_sr)
+    print(f"Saved streaming audio to 'streaming.wav' (sampling rate: {out_sr} Hz).")
 
     # Or use the following to display the audio in the jupyter notebook:
     # from IPython.display import Audio
