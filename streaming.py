@@ -47,6 +47,9 @@ def main():
     torch.manual_seed(421)
 
     def generator():
+        # Can stream from your LLM or other source here, just partition the text into
+        # sentences with nltk or rule based tokenizer. See example here:
+        # https://stackoverflow.com/a/31505798
         for text, emotion, pitch_std in zip(texts, emotions, pitch_stds):
             yield {
                 "text": text,
