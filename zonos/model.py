@@ -328,7 +328,7 @@ class Zonos(nn.Module):
     @torch.inference_mode()
     def stream(
         self,
-        prefix_conditioning: torch.Tensor,  # conditioning from text (and other modalities)
+        prefix_conditioning: torch.Tensor | Generator[dict, None, None],
         audio_prefix_codes: torch.Tensor | None = None,  # optional audio prefix codes
         max_new_tokens: int = 86 * 30,
         cfg_scale: float = 2.0,
@@ -341,7 +341,7 @@ class Zonos(nn.Module):
         Stream audio generation in chunks with smooth transitions between chunks.
 
         Args:
-            prefix_conditioning: Conditioning tensor from text and other modalities
+            prefix_conditioning: Conditioning tensor from text and other modalities or a generator of conditioning dictionaries
             audio_prefix_codes: Optional audio prefix codes
             max_new_tokens: Maximum number of new tokens to generate
             cfg_scale: Classifier-free guidance scale
@@ -414,9 +414,9 @@ class Zonos(nn.Module):
         samples_per_token = 512  # Approximate value based on DAC model
         window_size = chunk_overlap * samples_per_token
 
-        # Create window functions (more efficient with torch operations)
-        fade_in = torch.linspace(0, 1, window_size, device=device)
-        fade_out = torch.linspace(1, 0, window_size, device=device)
+        # Apply cosine fade for smooth transition
+        fade = torch.cos(torch.linspace(torch.pi, 0, window_size, device=codes.device))
+        fade = 0.5 * (1 + fade)
 
         while torch.max(remaining_steps) > 0:
             offset += 1
@@ -468,7 +468,7 @@ class Zonos(nn.Module):
 
                 # Apply fade-in to the first chunk
                 if previous_audio is None and current_audio.shape[-1] > window_size:
-                    current_audio[..., :window_size] *= fade_in
+                    current_audio[..., :window_size] *= fade
 
                 # Apply windowing and overlap-add for smooth transitions
                 if (
@@ -481,7 +481,7 @@ class Zonos(nn.Module):
                     previous_audio_end = previous_audio[..., -window_size:].clone()
 
                     # Crossfade the overlapping region
-                    current_audio[..., :window_size] = current_audio_start * fade_in + previous_audio_end * fade_out
+                    current_audio[..., :window_size] = current_audio_start * fade + previous_audio_end * (1 - fade)
 
                     # Yield the previous audio up to the overlap point
                     audio_to_yield = previous_audio[..., :-window_size]
