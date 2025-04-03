@@ -335,6 +335,7 @@ class Zonos(nn.Module):
         disable_torch_compile: bool = False,
         chunk_schedule: list[int] = [20, 20, 40, 60, 80],
         chunk_overlap: int = 2,
+        whitespace: str = " ",
     ) -> Generator[torch.Tensor, None, None]:
         """
         Stream audio generation in chunks with smooth transitions between chunks.
@@ -354,7 +355,7 @@ class Zonos(nn.Module):
         """
         assert cfg_scale != 1, "TODO: add support for cfg_scale=1"
         assert len(chunk_schedule) > 0, "chunk_schedule must not be empty"
-        assert all(chunk_overlap < size for size in chunk_schedule), "overlap must be less than all chunk sizes"
+        assert all(chunk_overlap * 2 < size for size in chunk_schedule), "overlap must be less than a half of a chunk"
 
         batch_size = 1  # Streaming generation is single-sample only
         device = self.device
@@ -369,11 +370,11 @@ class Zonos(nn.Module):
         window_size = chunk_overlap * samples_per_token
 
         # Create cosine fade for smooth transition
-        fade = torch.cos(torch.linspace(torch.pi, 0, window_size, device=device))
-        fade = 0.5 * (1 + fade)
+        cosfade = torch.cos(torch.linspace(torch.pi, 0, window_size, device=device))
+        cosfade = 0.5 * (1 + cosfade)
 
-        # Set up previous text and codes for hot swapping
-        prev_text = ""
+        # Set up first text and codes to use as a prefix for all generations
+        audio_prefix_text = ""
         previous_audio = None
 
         # Main loop: iterate over sentences in the prefix conditioning. For each sentence, we'll be streaming audio chunks out.
@@ -381,9 +382,8 @@ class Zonos(nn.Module):
         # audio_prefix_codes for the next sentence. Each subsequent generation is conditioned on the previous text and codes.
         for cond_dict in cond_dicts_generator:
             # Prepend the conditioning dictionary text with the previous sentence text
-            curr_text = cond_dict["text"] + " "
-            updated_cond_dict = {**cond_dict, "text": prev_text + curr_text}
-            prev_text = curr_text
+            curr_text = cond_dict["text"] + whitespace
+            updated_cond_dict = {**cond_dict, "text": audio_prefix_text + curr_text}
 
             prefix_conditioning = self.prepare_conditioning(make_cond_dict(**updated_cond_dict))
 
@@ -479,7 +479,7 @@ class Zonos(nn.Module):
 
                     # Apply fade-in to the first chunk
                     if previous_audio is None and current_audio.shape[-1] > window_size:
-                        current_audio[..., :window_size] *= fade
+                        current_audio[..., :window_size] *= cosfade
 
                     # Apply windowing and overlap-add for smooth transitions
                     if (
@@ -492,7 +492,7 @@ class Zonos(nn.Module):
                         prev_audio_end = previous_audio[..., -window_size:].clone()
 
                         # Crossfade the overlapping region
-                        previous_audio[..., -window_size:] = curr_audio_start * fade + prev_audio_end * (1 - fade)
+                        previous_audio[..., -window_size:] = curr_audio_start * cosfade + prev_audio_end * (1 - cosfade)
 
                     if previous_audio is not None:
                         yield previous_audio
@@ -506,20 +506,22 @@ class Zonos(nn.Module):
                     if schedule_index < len(chunk_schedule) - 1:
                         schedule_index += 1
 
-            # Assemble the full codes for this sentence
-            out_codes = revert_delay_pattern(delayed_codes)
-            out_codes.masked_fill_(out_codes >= 1024, 0)
-            out_codes = out_codes[..., : offset - 9]
-
             if audio_prefix_codes is None:
-                audio_prefix_codes = out_codes
-            else:
-                out_codes = out_codes[:, :, audio_prefix_codes.shape[-1] :]
-                audio_prefix_codes = out_codes
+                # Assemble the full codes for this sentence
+                audio_prefix_codes = revert_delay_pattern(delayed_codes)
+                audio_prefix_codes.masked_fill_(audio_prefix_codes >= 1024, 0)
+                audio_prefix_codes = audio_prefix_codes[..., : offset - 9]
+                audio_prefix_text = curr_text
+
+            if previous_audio is not None:
+                tail_size = min(2 * window_size, previous_audio.shape[-1])
+                logfade = torch.logspace(1, 0, tail_size, base=20, device=device)
+                logfade -= logfade.min()
+                logfade /= logfade.max()
+                previous_audio[..., -tail_size:] *= logfade
 
             self._cg_graph = None  # reset CUDA graph to avoid caching issues
 
-        # Don't forget to yield the final faded audio chunk
+        # Don't forget to yield the final audio chunk
         if previous_audio is not None:
-            previous_audio[..., -window_size:] *= fade[: min(window_size, previous_audio.shape[-1])]
             yield previous_audio
