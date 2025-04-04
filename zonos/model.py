@@ -527,6 +527,9 @@ class Zonos(nn.Module):
                     if schedule_index < len(chunk_schedule) - 1:
                         schedule_index += 1
 
+            # Yield the sentence string if mark_boundaries is True and it's not the warmup_prefill
+            if generator_index >= 0 and mark_boundaries:
+                yield curr_text
             if generator_index == 0:
                 # Assemble the full codes for this sentence
                 audio_prefix_codes = revert_delay_pattern(delayed_codes)
@@ -543,10 +546,6 @@ class Zonos(nn.Module):
 
             self._cg_graph = None  # reset CUDA graph to avoid caching issues
             generator_index += 1
-
-            # Yield the sentence string if mark_boundaries is True
-            if mark_boundaries:
-                yield curr_text
 
         # Don't forget to yield the final audio chunk
         if previous_audio is not None:
