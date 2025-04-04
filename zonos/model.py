@@ -1,3 +1,4 @@
+import itertools
 import json
 from typing import Callable, Generator
 
@@ -328,14 +329,15 @@ class Zonos(nn.Module):
     def stream(
         self,
         cond_dicts_generator: Generator[dict, None, None],
-        audio_prefix_codes: torch.Tensor | None = None,  # optional audio prefix codes
+        audio_prefix_codes: torch.Tensor | None = None,
         max_new_tokens: int = 86 * 30,
         cfg_scale: float = 2.0,
         sampling_params: dict = dict(min_p=0.1),
         disable_torch_compile: bool = False,
-        chunk_schedule: list[int] = [20, 20, 40, 60, 80],
+        chunk_schedule: list[int] = [16, *range(9, 100)],
         chunk_overlap: int = 2,
         whitespace: str = " ",
+        warmup: str = "",
     ) -> Generator[torch.Tensor, None, None]:
         """
         Stream audio generation in chunks with smooth transitions between chunks.
@@ -349,6 +351,8 @@ class Zonos(nn.Module):
             disable_torch_compile: Whether to disable torch.compile
             chunk_schedule: List of chunk sizes to use in sequence (will use the last size for remaining chunks)
             chunk_overlap: Number of tokens to overlap between chunks (also determines audio crossfade size)
+            whitespace: Whitespace to use between sentences
+            warmup: A warmup string to generate before the first generator chunk
 
         Yields:
             Audio chunks as torch tensors
@@ -376,10 +380,17 @@ class Zonos(nn.Module):
         # Set up first text and codes to use as a prefix for all generations
         audio_prefix_text = ""
         previous_audio = None
+        generator_index = 0
+        first_chunk_yielded = False
 
-        # Main loop: iterate over sentences in the prefix conditioning. For each sentence, we'll be streaming audio chunks out.
-        # Once the sentence is ready, we'll hot swap the previous text and codes with the new ones and use them as
-        # audio_prefix_codes for the next sentence. Each subsequent generation is conditioned on the previous text and codes.
+        # A hack to warm up the model - we can start the stream beforehand and generate a few tokens upfront
+        # so when we actually receive the first sentence, we can start streaming faster
+        if warmup:
+            cond_dicts_generator = itertools.chain([{"text": warmup}], cond_dicts_generator)
+            generator_index = -1  # set this to -1 to skip that warmup chunk and never yield it
+
+        # Main loop: iterate over sentences in the cond_dicts_generator. For each sentence, we'll be streaming audio chunks out.
+        # Once the first sentence is ready, we'll use it's codes as audio_prefix_codes for all the next sentences
         for cond_dict in cond_dicts_generator:
             # Prepend the conditioning dictionary text with the previous sentence text
             curr_text = cond_dict["text"] + whitespace
@@ -494,7 +505,15 @@ class Zonos(nn.Module):
                         # Crossfade the overlapping region
                         previous_audio[..., -window_size:] = curr_audio_start * cosfade + prev_audio_end * (1 - cosfade)
 
-                    if previous_audio is not None:
+                    if previous_audio is not None and generator_index >= 0:
+                        # Apply a log fade in to the first chunk to avoid a pop
+                        if not first_chunk_yielded:
+                            logfade = torch.logspace(1, 0, 2 * window_size, base=20, device=device)
+                            logfade -= logfade.min()
+                            logfade /= logfade.max()
+                            previous_audio[..., : 2 * window_size] *= logfade.flip(0)
+                            first_chunk_yielded = True
+
                         yield previous_audio
 
                     # Store current audio for next iteration and update counters
@@ -506,7 +525,7 @@ class Zonos(nn.Module):
                     if schedule_index < len(chunk_schedule) - 1:
                         schedule_index += 1
 
-            if audio_prefix_codes is None:
+            if generator_index == 0:
                 # Assemble the full codes for this sentence
                 audio_prefix_codes = revert_delay_pattern(delayed_codes)
                 audio_prefix_codes.masked_fill_(audio_prefix_codes >= 1024, 0)
@@ -521,6 +540,7 @@ class Zonos(nn.Module):
                 previous_audio[..., -tail_size:] *= logfade
 
             self._cg_graph = None  # reset CUDA graph to avoid caching issues
+            generator_index += 1
 
         # Don't forget to yield the final audio chunk
         if previous_audio is not None:

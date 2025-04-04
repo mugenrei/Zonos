@@ -51,11 +51,19 @@ def main():
     # Set a random seed for reproducibility.
     torch.manual_seed(777)
 
+    # Accumulate audio chunks as they are generated.
+    audio_chunks = []
+    t0 = time.time()
+    generated = 0
+    ttfb = None
+
     def generator():
         # Can stream from your LLM or other source here, just partition the text into
         # sentences with nltk or rule based tokenizer. See example here:
         # https://stackoverflow.com/a/31505798
         for text in texts:
+            elapsed = int((time.time() - t0) * 1000)
+            print(f"Yielding sentence {elapsed}ms: {text}")
             yield {
                 "text": text,
                 "speaker": speaker,
@@ -69,23 +77,19 @@ def main():
     # then gradually increase to larger chunks for fewer cuts
     stream_generator = model.stream(
         cond_dicts_generator=generator(),
-        chunk_schedule=[17, *range(9, 100)],  # optimal schedule for RTX3090
+        chunk_schedule=[15, 9, 9, 9, 9, 9, *range(9, 100)],  # optimal schedule for RTX3090 and this warmup
         chunk_overlap=2,  # tokens to overlap between chunks (affects crossfade)
+        warmup="And I say OK",
     )
-
-    # Accumulate audio chunks as they are generated.
-    audio_chunks = []
-    t0 = time.time()
-    generated = 0
-    ttfb = None
 
     for i, audio_chunk in enumerate(stream_generator):
         audio_chunks.append(audio_chunk)
         elapsed = int((time.time() - t0) * 1000)
         if not i:
             ttfb = elapsed
+        gap = "GAP" if ttfb + generated < elapsed else ""
         generated += int(audio_chunk.shape[1] / 44.1)
-        print(f"Chunk {i + 1:>3}: elapsed {elapsed:>5}ms | generated up to {ttfb + generated:>5}ms")
+        print(f"Chunk {i + 1:>3}: elapsed {elapsed:>5}ms | generated up to {ttfb + generated:>5}ms {gap}")
 
     # Concatenate all audio chunks along the time axis.
     audio = torch.cat(audio_chunks, dim=-1).cpu()
