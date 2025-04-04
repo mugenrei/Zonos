@@ -337,8 +337,9 @@ class Zonos(nn.Module):
         chunk_schedule: list[int] = [16, *range(9, 100)],
         chunk_overlap: int = 2,
         whitespace: str = " ",
-        warmup: str = "",
-    ) -> Generator[torch.Tensor, None, None]:
+        warmup_prefill: str = "",
+        mark_boundaries: bool = False,
+    ) -> Generator[torch.Tensor | str, None, None]:
         """
         Stream audio generation in chunks with smooth transitions between chunks.
 
@@ -352,10 +353,11 @@ class Zonos(nn.Module):
             chunk_schedule: List of chunk sizes to use in sequence (will use the last size for remaining chunks)
             chunk_overlap: Number of tokens to overlap between chunks (also determines audio crossfade size)
             whitespace: Whitespace to use between sentences
-            warmup: A warmup string to generate before the first generator chunk
+            warmup_prefill: A warmup string to generate before the first generator chunk
+            mark_boundaries: Whether to yield sentence strings as indicators of the sentence end
 
         Yields:
-            Audio chunks as torch tensors
+            Audio chunks as torch tensors [and sentence strings as indicators of the sentence end if mark_boundaries is True]
         """
         assert cfg_scale != 1, "TODO: add support for cfg_scale=1"
         assert len(chunk_schedule) > 0, "chunk_schedule must not be empty"
@@ -385,16 +387,16 @@ class Zonos(nn.Module):
 
         # A hack to warm up the model - we can start the stream beforehand and generate a few tokens upfront
         # so when we actually receive the first sentence, we can start streaming faster
-        if warmup:
-            cond_dicts_generator = itertools.chain([{"text": warmup}], cond_dicts_generator)
+        if warmup_prefill:
+            cond_dicts_generator = itertools.chain([{"text": warmup_prefill}], cond_dicts_generator)
             generator_index = -1  # set this to -1 to skip that warmup chunk and never yield it
 
         # Main loop: iterate over sentences in the cond_dicts_generator. For each sentence, we'll be streaming audio chunks out.
         # Once the first sentence is ready, we'll use it's codes as audio_prefix_codes for all the next sentences
         for cond_dict in cond_dicts_generator:
             # Prepend the conditioning dictionary text with the previous sentence text
-            curr_text = cond_dict["text"] + whitespace
-            updated_cond_dict = {**cond_dict, "text": audio_prefix_text + curr_text}
+            curr_text = cond_dict["text"]
+            updated_cond_dict = {**cond_dict, "text": audio_prefix_text + curr_text + whitespace}
 
             prefix_conditioning = self.prepare_conditioning(make_cond_dict(**updated_cond_dict))
 
@@ -525,12 +527,14 @@ class Zonos(nn.Module):
                     if schedule_index < len(chunk_schedule) - 1:
                         schedule_index += 1
 
+            if generator_index >= 0 and mark_boundaries:
+                yield curr_text
             if generator_index == 0:
                 # Assemble the full codes for this sentence
                 audio_prefix_codes = revert_delay_pattern(delayed_codes)
                 audio_prefix_codes.masked_fill_(audio_prefix_codes >= 1024, 0)
                 audio_prefix_codes = audio_prefix_codes[..., : offset - 9]
-                audio_prefix_text = curr_text
+                audio_prefix_text = curr_text + whitespace
 
             if previous_audio is not None:
                 tail_size = min(2 * window_size, previous_audio.shape[-1])
