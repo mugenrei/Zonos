@@ -90,7 +90,7 @@ def main():
 
         audio_chunks.append(audio_chunk)
         elapsed = int((time.time() - t0) * 1000)
-        if not i:
+        if ttfb is None:
             ttfb = elapsed
         gap = "GAP" if ttfb + generated < elapsed else ""
         generated += int(audio_chunk.shape[1] / 44.1)
