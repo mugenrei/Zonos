@@ -1,5 +1,6 @@
 import itertools
 import json
+import threading
 from typing import Callable, Generator
 
 import safetensors
@@ -47,6 +48,8 @@ class Zonos(nn.Module):
 
         if config.pad_vocab_to_multiple_of:
             self.register_load_state_dict_post_hook(self._pad_embeddings_and_heads)
+
+        self.conditioning_lock = threading.Lock()
 
     def _pad_embeddings_and_heads(self, *args, **kwargs):
         for w in [*self.embeddings, *self.heads]:
@@ -214,12 +217,13 @@ class Zonos(nn.Module):
     def prepare_conditioning(self, cond_dict: dict, uncond_dict: dict | None = None) -> torch.Tensor:
         if uncond_dict is None:
             uncond_dict = {k: cond_dict[k] for k in self.prefix_conditioner.required_keys}
-        return torch.cat(
-            [
-                self.prefix_conditioner(cond_dict),
-                self.prefix_conditioner(uncond_dict),
-            ]
-        )
+        with self.conditioning_lock:
+            return torch.cat(
+                [
+                    self.prefix_conditioner(cond_dict),
+                    self.prefix_conditioner(uncond_dict),
+                ]
+            )
 
     def can_use_cudagraphs(self) -> bool:
         # Only the mamba-ssm backbone supports CUDA Graphs at the moment
