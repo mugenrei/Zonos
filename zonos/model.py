@@ -1,6 +1,4 @@
-import itertools
 import json
-import threading
 from typing import Callable, Generator
 
 import safetensors
@@ -48,8 +46,6 @@ class Zonos(nn.Module):
 
         if config.pad_vocab_to_multiple_of:
             self.register_load_state_dict_post_hook(self._pad_embeddings_and_heads)
-
-        self.conditioning_lock = threading.Lock()
 
     def _pad_embeddings_and_heads(self, *args, **kwargs):
         for w in [*self.embeddings, *self.heads]:
@@ -217,13 +213,12 @@ class Zonos(nn.Module):
     def prepare_conditioning(self, cond_dict: dict, uncond_dict: dict | None = None) -> torch.Tensor:
         if uncond_dict is None:
             uncond_dict = {k: cond_dict[k] for k in self.prefix_conditioner.required_keys}
-        with self.conditioning_lock:
-            return torch.cat(
-                [
-                    self.prefix_conditioner(cond_dict),
-                    self.prefix_conditioner(uncond_dict),
-                ]
-            )
+        return torch.cat(
+            [
+                self.prefix_conditioner(cond_dict),
+                self.prefix_conditioner(uncond_dict),
+            ]
+        )
 
     def can_use_cudagraphs(self) -> bool:
         # Only the mamba-ssm backbone supports CUDA Graphs at the moment
@@ -340,7 +335,6 @@ class Zonos(nn.Module):
         chunk_schedule: list[int] = [16, *range(9, 100)],
         chunk_overlap: int = 2,
         whitespace: str = " ",
-        warmup_prefill: str = "",
         mark_boundaries: bool = False,
     ) -> Generator[torch.Tensor | str, None, None]:
         """
@@ -356,7 +350,6 @@ class Zonos(nn.Module):
             chunk_schedule: List of chunk sizes to use in sequence (will use the last size for remaining chunks)
             chunk_overlap: Number of tokens to overlap between chunks (also determines audio crossfade size)
             whitespace: Whitespace to use between sentences
-            warmup_prefill: A warmup string to generate before the first generator chunk
             mark_boundaries: Whether to yield sentence strings as indicators of the sentence end
 
         Yields:
@@ -376,23 +369,15 @@ class Zonos(nn.Module):
 
         # Calculate window size based on overlap tokens (approx. samples per token)
         samples_per_token = 512  # Approximate value based on DAC model
-        window_size = chunk_overlap * samples_per_token
+        overlap = chunk_overlap * samples_per_token
 
         # Create cosine fade for smooth transition
-        cosfade = torch.cos(torch.linspace(torch.pi, 0, window_size, device=device))
-        cosfade = 0.5 * (1 + cosfade)
+        cosfade = 0.5 * (1 + torch.cos(torch.linspace(torch.pi, 0, overlap, device=device)))
 
         # Set up first text and codes to use as a prefix for all generations
         audio_prefix_text = ""
         previous_audio = None
         generator_index = 0
-        first_chunk_yielded = False
-
-        # A hack to warm up the model - we can start the stream beforehand and generate a few tokens upfront
-        # so when we actually receive the first sentence, we can start streaming faster
-        if warmup_prefill:
-            cond_dicts_generator = itertools.chain([{"text": warmup_prefill}], cond_dicts_generator)
-            generator_index = -1  # set this to -1 to skip that warmup chunk and never yield it
 
         # Main loop: iterate over sentences in the cond_dicts_generator. For each sentence, we'll be streaming audio chunks out.
         # Once the first sentence is ready, we'll use it's codes as audio_prefix_codes for all the next sentences
@@ -439,7 +424,7 @@ class Zonos(nn.Module):
             remaining_steps = torch.full((batch_size,), max_steps, device=device)
             step = 0
             # This variable will let us yield only the new audio since the last yield.
-            prev_valid_length = prefix_audio_len
+            yielded_len = prefix_audio_len
             chunk_counter = 0
 
             # For chunk scheduling
@@ -475,7 +460,9 @@ class Zonos(nn.Module):
                 chunk_counter += 1
 
                 # --- Every 'chunk_size' tokens (or when finished), decode and yield the new audio ---
-                if (chunk_counter >= chunk_schedule[schedule_index]) or (torch.all(remaining_steps == 0)):
+                if (chunk_counter + chunk_overlap + 9 >= chunk_schedule[schedule_index]) or (
+                    torch.all(remaining_steps == 0)
+                ):
                     # In Zonos, the final output codes are produced by reverting the delay pattern.
                     # Only tokens up to (offset - 9) are valid.
                     full_codes = revert_delay_pattern(delayed_codes)
@@ -483,47 +470,27 @@ class Zonos(nn.Module):
 
                     # Get the valid portion of the latent sequence.
                     valid_length = offset - 9
-
-                    # Include overlap with previous chunk for smoother transitions
-                    # For the first chunk, there's no previous chunk to overlap with
-                    start_idx = max(0, prev_valid_length - chunk_overlap)
-                    partial_codes = full_codes[..., start_idx:valid_length]
+                    partial_codes = full_codes[..., yielded_len:valid_length]
 
                     # Decode the current chunk to audio (keep on device)
                     current_audio = self.autoencoder.decode(partial_codes)[0]
+                    size = min(overlap, current_audio.shape[-1])
+                    current_audio[..., :size] *= cosfade[-size:]
+                    if previous_audio is not None:
+                        current_audio[..., :size] += previous_audio[..., -size:] * (1 - cosfade[:size])
 
-                    # Apply fade-in to the first chunk
-                    if previous_audio is None and current_audio.shape[-1] > window_size:
-                        current_audio[..., :window_size] *= cosfade
+                    if schedule_index == 0:  # fade in the first chunk of sentence to smooth the pop
+                        size = min(2 * overlap, current_audio.shape[-1])
+                        logfade = torch.logspace(1, 0, size, base=20, device=device)
+                        logfade -= logfade.min()
+                        logfade /= logfade.max()
+                        current_audio[..., :size] *= logfade.flip(0)
 
-                    # Apply windowing and overlap-add for smooth transitions
-                    if (
-                        previous_audio is not None
-                        and current_audio.shape[-1] > window_size
-                        and previous_audio.shape[-1] > window_size
-                    ):
-                        # Apply windowing to overlapping regions
-                        curr_audio_start = current_audio[..., :window_size].clone()
-                        prev_audio_end = previous_audio[..., -window_size:].clone()
-
-                        # Crossfade the overlapping region
-                        previous_audio[..., -window_size:] = curr_audio_start * cosfade + prev_audio_end * (1 - cosfade)
-
-                    if previous_audio is not None and generator_index >= 0:
-                        # Apply a log fade in to the first chunk to avoid a pop
-                        if not first_chunk_yielded:
-                            head_size = min(2 * window_size, previous_audio.shape[-1])
-                            logfade = torch.logspace(1, 0, head_size, base=20, device=device)
-                            logfade -= logfade.min()
-                            logfade /= logfade.max()
-                            previous_audio[..., :head_size] *= logfade.flip(0)
-                            first_chunk_yielded = True
-
-                        yield previous_audio
+                    yield current_audio[..., :-overlap]
 
                     # Store current audio for next iteration and update counters
-                    previous_audio = current_audio[..., window_size:]
-                    prev_valid_length = valid_length
+                    previous_audio = current_audio
+                    yielded_len = valid_length - chunk_overlap
                     chunk_counter = 0
 
                     # Update chunk size according to schedule
@@ -531,18 +498,18 @@ class Zonos(nn.Module):
                         schedule_index += 1
 
             if generator_index == 0:
-                # Assemble the full codes for this sentence
+                # Assemble the full codes for this sentence and set the audio_prefix_codes to equal first sentence generated audio
                 audio_prefix_codes = revert_delay_pattern(delayed_codes)
                 audio_prefix_codes.masked_fill_(audio_prefix_codes >= 1024, 0)
                 audio_prefix_codes = audio_prefix_codes[..., : offset - 9]
                 audio_prefix_text = curr_text + whitespace
 
             if previous_audio is not None:
-                tail_size = min(2 * window_size, previous_audio.shape[-1])
-                logfade = torch.logspace(1, 0, tail_size, base=20, device=device)
+                size = min(2 * overlap, previous_audio.shape[-1])
+                logfade = torch.logspace(1, 0, size, base=20, device=device)
                 logfade -= logfade.min()
                 logfade /= logfade.max()
-                previous_audio[..., -tail_size:] *= logfade
+                previous_audio[..., -size:] *= logfade
 
             self._cg_graph = None  # reset CUDA graph to avoid caching issues
             generator_index += 1

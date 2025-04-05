@@ -77,9 +77,8 @@ def main():
     # then gradually increase to larger chunks for fewer cuts
     stream_generator = model.stream(
         cond_dicts_generator=generator(),
-        chunk_schedule=[15, 9, 9, 9, 9, 9, *range(9, 100)],  # optimal schedule for RTX3090 and this warmup
-        chunk_overlap=2,  # tokens to overlap between chunks (affects crossfade)
-        warmup_prefill="And then I say:",
+        chunk_schedule=[22, 13, *range(12, 100)],  # optimal schedule for RTX3090
+        chunk_overlap=1,  # tokens to overlap between chunks (affects crossfade)
         mark_boundaries=True,
     )
 
